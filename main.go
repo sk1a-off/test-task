@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -156,7 +157,12 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPut:
-		values, ok := r.URL.Query()["v"]
+		query, err := url.ParseQuery(r.URL.RawQuery)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		values, ok := query["v"]
 		if !ok {
 			w.WriteHeader(http.StatusBadRequest)
 			return
@@ -186,7 +192,11 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func requestTimeout(r *http.Request) (time.Duration, error) {
-	values, ok := r.URL.Query()["timeout"]
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return 0, err
+	}
+	values, ok := query["timeout"]
 	if !ok {
 		return 0, nil
 	}
