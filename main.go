@@ -171,6 +171,7 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 
 	case http.MethodGet:
+		w.Header().Set("Cache-Control", "no-store")
 		timeout, err := requestTimeout(r)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
