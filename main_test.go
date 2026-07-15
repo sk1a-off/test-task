@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"runtime"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -100,6 +99,22 @@ func waitGroup(t *testing.T, wg *sync.WaitGroup) {
 	}
 }
 
+func expectedMessages(total int) map[string]struct{} {
+	expected := make(map[string]struct{}, total)
+	for i := range total {
+		expected[fmt.Sprintf("message-%d", i)] = struct{}{}
+	}
+	return expected
+}
+
+func requireExpectedMessage(t *testing.T, expected map[string]struct{}, message string) {
+	t.Helper()
+	if _, ok := expected[message]; !ok {
+		t.Fatalf("unexpected or duplicate message %q", message)
+	}
+	delete(expected, message)
+}
+
 func TestHandlerPutGetFIFO(t *testing.T) {
 	h := handler{broker: newBroker()}
 	requireResponse(t, request(h, http.MethodPut, "/pet?v=cat"), http.StatusOK, "")
@@ -174,6 +189,22 @@ func TestHandlerErrorBodiesAreEmpty(t *testing.T) {
 	}
 }
 
+func TestHandlerRejectsMalformedQueryWithoutChangingQueue(t *testing.T) {
+	h := handler{broker: newBroker()}
+	requireResponse(t, request(h, http.MethodPut, "/q?v=kept"), http.StatusOK, "")
+	requireResponse(t, request(h, http.MethodGet, "/q?timeout=1;bad=2"), http.StatusBadRequest, "")
+	requireResponse(t, request(h, http.MethodGet, "/q"), http.StatusOK, "kept")
+
+	requireResponse(t, request(h, http.MethodPut, "/other?v=bad&x=a;b"), http.StatusBadRequest, "")
+	requireResponse(t, request(h, http.MethodGet, "/other"), http.StatusNotFound, "")
+
+	r := httptest.NewRequest(http.MethodGet, "/q", nil)
+	r.URL.RawQuery = "timeout=%zz"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	requireResponse(t, w, http.StatusBadRequest, "")
+}
+
 func TestRequestTimeout(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -189,6 +220,7 @@ func TestRequestTimeout(t *testing.T) {
 		{"negative", "/q?timeout=-1", 0, true},
 		{"fraction", "/q?timeout=1.5", 0, true},
 		{"text", "/q?timeout=soon", 0, true},
+		{"malformed separator", "/q?timeout=1;bad=2", 0, true},
 		{"duration maximum seconds", "/q?timeout=9223372036", 9223372036 * time.Second, false},
 		{"duration overflow", "/q?timeout=9223372037", 0, true},
 		{"uint64 overflow", "/q?timeout=18446744073709551616", 0, true},
@@ -270,7 +302,20 @@ func TestHandlerWaiterFIFO(t *testing.T) {
 func TestHandlerTimeoutExpires(t *testing.T) {
 	b := newBroker()
 	h := handler{broker: b}
-	requireResponse(t, request(h, http.MethodGet, "/q?timeout=1"), http.StatusNotFound, "")
+	r := httptest.NewRequest(http.MethodGet, "/q?timeout=1", nil)
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(w, r)
+		close(done)
+	}()
+	waitForWaiters(t, b, "q", 1)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout handler did not finish")
+	}
+	requireResponse(t, w, http.StatusNotFound, "")
 	requireQueueAbsent(t, b, "q")
 }
 
@@ -336,7 +381,7 @@ func TestBrokerCanceledWaitersDoNotBlock(t *testing.T) {
 	firstCtx, cancelFirst := context.WithCancel(context.Background())
 	first := asyncGet(firstCtx, b, "q", time.Hour)
 	waitForWaiters(t, b, "q", 1)
-	second := asyncGet(context.Background(), b, "q", time.Hour)
+	second := asyncGet(context.Background(), b, "q", 5*time.Second)
 	waitForWaiters(t, b, "q", 2)
 
 	cancelFirst()
@@ -352,12 +397,12 @@ func TestBrokerCanceledWaitersDoNotBlock(t *testing.T) {
 
 func TestBrokerCanceledMiddleWaiter(t *testing.T) {
 	b := newBroker()
-	first := asyncGet(context.Background(), b, "q", time.Hour)
+	first := asyncGet(context.Background(), b, "q", 5*time.Second)
 	waitForWaiters(t, b, "q", 1)
 	middleCtx, cancelMiddle := context.WithCancel(context.Background())
-	middle := asyncGet(middleCtx, b, "q", time.Hour)
+	middle := asyncGet(middleCtx, b, "q", 5*time.Second)
 	waitForWaiters(t, b, "q", 2)
-	last := asyncGet(context.Background(), b, "q", time.Hour)
+	last := asyncGet(context.Background(), b, "q", 5*time.Second)
 	waitForWaiters(t, b, "q", 3)
 
 	cancelMiddle()
@@ -373,6 +418,27 @@ func TestBrokerCanceledMiddleWaiter(t *testing.T) {
 	if got := receiveResult(t, last); got != (getResult{"two", true}) {
 		t.Fatalf("last waiter = %#v", got)
 	}
+}
+
+func TestBrokerManyCanceledWaitersAreCleaned(t *testing.T) {
+	const total = 200
+	b := newBroker()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	results := make([]<-chan getResult, 0, total)
+	for range total {
+		results = append(results, asyncGet(ctx, b, "q", 5*time.Second))
+	}
+	waitForWaiters(t, b, "q", total)
+
+	cancel()
+	for _, result := range results {
+		if got := receiveResult(t, result); got.ok {
+			t.Fatalf("canceled waiter received %#v", got)
+		}
+	}
+	waitForWaiters(t, b, "q", 0)
+	requireQueueAbsent(t, b, "q")
 }
 
 func TestBrokerPutSkipsAlreadyDoneWaiter(t *testing.T) {
@@ -449,16 +515,16 @@ func TestConcurrentPutNoLoss(t *testing.T) {
 	}
 	waitGroup(t, &wg)
 
-	seen := make(map[string]bool, total)
+	expected := expectedMessages(total)
 	for range total {
 		message, ok := b.get(context.Background(), "q", 0)
-		if !ok || seen[message] {
-			t.Fatalf("invalid delivery (%q, %v), duplicate=%v", message, ok, seen[message])
+		if !ok {
+			t.Fatal("message was lost")
 		}
-		seen[message] = true
+		requireExpectedMessage(t, expected, message)
 	}
-	if _, ok := b.get(context.Background(), "q", 0); ok || len(seen) != total {
-		t.Fatalf("delivered %d unique messages, want %d", len(seen), total)
+	if _, ok := b.get(context.Background(), "q", 0); ok || len(expected) != 0 {
+		t.Fatalf("%d expected messages remain", len(expected))
 	}
 }
 
@@ -483,18 +549,17 @@ func TestConcurrentGetNoDuplicates(t *testing.T) {
 	waitGroup(t, &wg)
 	close(results)
 
-	seen := make(map[string]bool, total)
+	expected := expectedMessages(total)
+	misses := 0
 	for result := range results {
 		if !result.ok {
+			misses++
 			continue
 		}
-		if seen[result.message] {
-			t.Fatalf("duplicate delivery %q", result.message)
-		}
-		seen[result.message] = true
+		requireExpectedMessage(t, expected, result.message)
 	}
-	if len(seen) != total {
-		t.Fatalf("delivered %d unique messages, want %d", len(seen), total)
+	if len(expected) != 0 || misses != extraConsumers {
+		t.Fatalf("remaining messages = %d, misses = %d", len(expected), misses)
 	}
 }
 
@@ -532,15 +597,15 @@ func TestConcurrentProducersAndConsumers(t *testing.T) {
 	waitGroup(t, &consumers)
 	close(results)
 
-	seen := make(map[string]bool, total)
+	expected := expectedMessages(total)
 	for result := range results {
-		if !result.ok || seen[result.message] {
-			t.Fatalf("invalid result %#v, duplicate=%v", result, seen[result.message])
+		if !result.ok {
+			t.Fatalf("message was lost: %#v", result)
 		}
-		seen[result.message] = true
+		requireExpectedMessage(t, expected, result.message)
 	}
-	if len(seen) != total {
-		t.Fatalf("delivered %d unique messages, want %d", len(seen), total)
+	if len(expected) != 0 {
+		t.Fatalf("%d expected messages remain", len(expected))
 	}
 	requireQueueAbsent(t, b, "q")
 }
@@ -585,17 +650,22 @@ func TestConcurrentIndependentQueues(t *testing.T) {
 	waitGroup(t, &consumers)
 	close(results)
 
-	seen := make(map[string]bool, queueCount*perQueue)
+	expected := make(map[string]struct{}, queueCount*perQueue)
+	for queueNumber := range queueCount {
+		for i := range perQueue {
+			key := fmt.Sprintf("%d/%d-%d", queueNumber, queueNumber, i)
+			expected[key] = struct{}{}
+		}
+	}
 	for result := range results {
 		key := fmt.Sprintf("%d/%s", result.queue, result.message)
-		wantPrefix := fmt.Sprintf("%d-", result.queue)
-		if !result.ok || !strings.HasPrefix(result.message, wantPrefix) || seen[key] {
+		if !result.ok {
 			t.Fatalf("invalid cross-queue result %#v", result)
 		}
-		seen[key] = true
+		requireExpectedMessage(t, expected, key)
 	}
-	if len(seen) != queueCount*perQueue {
-		t.Fatalf("delivered %d messages, want %d", len(seen), queueCount*perQueue)
+	if len(expected) != 0 {
+		t.Fatalf("%d cross-queue messages remain", len(expected))
 	}
 	for queueNumber := range queueCount {
 		requireQueueAbsent(t, b, fmt.Sprintf("queue-%d", queueNumber))
