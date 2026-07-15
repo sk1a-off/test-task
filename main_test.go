@@ -124,6 +124,9 @@ func TestHandlerPutGetFIFO(t *testing.T) {
 	if contentType := w.Header().Get("Content-Type"); contentType != "text/plain; charset=utf-8" {
 		t.Fatalf("Content-Type = %q", contentType)
 	}
+	if cacheControl := w.Header().Get("Cache-Control"); cacheControl != "no-store" {
+		t.Fatalf("Cache-Control = %q", cacheControl)
+	}
 	requireResponse(t, request(h, http.MethodGet, "/pet"), http.StatusOK, "dog")
 	requireResponse(t, request(h, http.MethodGet, "/pet"), http.StatusNotFound, "")
 }
@@ -134,7 +137,11 @@ func TestHandlerMissingAndEmptyValue(t *testing.T) {
 
 	for _, target := range []string{"/empty?v=", "/empty?v"} {
 		requireResponse(t, request(h, http.MethodPut, target), http.StatusOK, "")
-		requireResponse(t, request(h, http.MethodGet, "/empty"), http.StatusOK, "")
+		w := request(h, http.MethodGet, "/empty")
+		requireResponse(t, w, http.StatusOK, "")
+		if w.Header().Get("Cache-Control") != "no-store" {
+			t.Fatal("empty message response is cacheable")
+		}
 	}
 	requireResponse(t, request(h, http.MethodPut, "/value?v=first&v=second"), http.StatusOK, "")
 	requireResponse(t, request(h, http.MethodGet, "/value"), http.StatusOK, "first")
@@ -169,6 +176,8 @@ func TestHandlerPathAndMethodPolicy(t *testing.T) {
 
 	requireResponse(t, request(h, http.MethodPut, "/team/backend?v=go"), http.StatusOK, "")
 	requireResponse(t, request(h, http.MethodGet, "/team/backend"), http.StatusOK, "go")
+	requireResponse(t, request(h, http.MethodPut, "/encoded%2Fslash?v=value"), http.StatusOK, "")
+	requireResponse(t, request(h, http.MethodGet, "/encoded/slash"), http.StatusOK, "value")
 }
 
 func TestHandlerErrorBodiesAreEmpty(t *testing.T) {
@@ -185,7 +194,11 @@ func TestHandlerErrorBodiesAreEmpty(t *testing.T) {
 		{http.MethodGet, "/q?timeout=1&timeout=2", http.StatusBadRequest},
 	}
 	for _, test := range tests {
-		requireResponse(t, request(h, test.method, test.target), test.code, "")
+		w := request(h, test.method, test.target)
+		requireResponse(t, w, test.code, "")
+		if test.method == http.MethodGet && w.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("GET %s is cacheable", test.target)
+		}
 	}
 }
 
