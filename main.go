@@ -23,10 +23,19 @@ type queue struct {
 	waiters  list.List
 }
 
+type waiterState uint8
+
+const (
+	waiterWaiting waiterState = iota
+	waiterDelivered
+	waiterCanceled
+)
+
 type waiter struct {
-	ch        chan string
-	element   *list.Element
-	delivered bool
+	ch      chan string
+	done    <-chan struct{}
+	element *list.Element
+	state   waiterState
 }
 
 func newBroker() *broker {
@@ -43,14 +52,24 @@ func (b *broker) put(name, message string) {
 		b.queues[name] = q
 	}
 
-	if element := q.waiters.Front(); element != nil {
-		q.waiters.Remove(element)
+	for q.waiters.Len() > 0 {
+		element := q.waiters.Front()
 		w := element.Value.(*waiter)
-		w.delivered = true
-		w.ch <- message
-		if len(q.messages) == 0 && q.waiters.Len() == 0 {
-			delete(b.queues, name)
+
+		select {
+		case <-w.done:
+			q.waiters.Remove(element)
+			w.element = nil
+			w.state = waiterCanceled
+			continue
+		default:
 		}
+
+		q.waiters.Remove(element)
+		w.element = nil
+		w.state = waiterDelivered
+		w.ch <- message
+		b.deleteIfEmpty(name, q)
 		return
 	}
 
@@ -58,16 +77,25 @@ func (b *broker) put(name, message string) {
 }
 
 func (b *broker) get(ctx context.Context, name string, timeout time.Duration) (string, bool) {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
 	b.mu.Lock()
+	if ctx.Err() != nil {
+		b.mu.Unlock()
+		return "", false
+	}
+
 	q := b.queues[name]
 
 	if q != nil && len(q.messages) > 0 {
 		message := q.messages[0]
 		q.messages[0] = ""
 		q.messages = q.messages[1:]
-		if len(q.messages) == 0 && q.waiters.Len() == 0 {
-			delete(b.queues, name)
-		}
+		b.deleteIfEmpty(name, q)
 		b.mu.Unlock()
 		return message, true
 	}
@@ -81,28 +109,37 @@ func (b *broker) get(ctx context.Context, name string, timeout time.Duration) (s
 		q = &queue{}
 		b.queues[name] = q
 	}
-	w := &waiter{ch: make(chan string, 1)}
+	w := &waiter{
+		ch:    make(chan string, 1),
+		done:  ctx.Done(),
+		state: waiterWaiting,
+	}
 	w.element = q.waiters.PushBack(w)
 	b.mu.Unlock()
-
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	select {
 	case message := <-w.ch:
 		return message, true
 	case <-ctx.Done():
 		b.mu.Lock()
-		if !w.delivered {
+		if w.state == waiterWaiting {
 			q.waiters.Remove(w.element)
-			if len(q.messages) == 0 && q.waiters.Len() == 0 {
-				delete(b.queues, name)
-			}
-			b.mu.Unlock()
-			return "", false
+			w.element = nil
+			w.state = waiterCanceled
+			b.deleteIfEmpty(name, q)
 		}
+		delivered := w.state == waiterDelivered
 		b.mu.Unlock()
-		return <-w.ch, true
+		if delivered {
+			return <-w.ch, true
+		}
+		return "", false
+	}
+}
+
+func (b *broker) deleteIfEmpty(name string, q *queue) {
+	if b.queues[name] == q && len(q.messages) == 0 && q.waiters.Len() == 0 {
+		delete(b.queues, name)
 	}
 }
 
@@ -152,6 +189,9 @@ func requestTimeout(r *http.Request) (time.Duration, error) {
 	values, ok := r.URL.Query()["timeout"]
 	if !ok {
 		return 0, nil
+	}
+	if len(values) != 1 {
+		return 0, strconv.ErrSyntax
 	}
 	if _, err := strconv.ParseUint(values[0], 10, 64); err != nil {
 		return 0, err
